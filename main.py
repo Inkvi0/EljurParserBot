@@ -3,62 +3,94 @@ import fake_useragent
 from bs4 import BeautifulSoup
 import datetime
 import locale
-from dotenv import load_dotenv
-import os
 
-load_dotenv()
-
-ELJUR_USERNAME = os.getenv('ELJUR_USERNAME')
-ELJUR_PASSWORD = os.getenv('ELJUR_PASSWORD')
+from datetime import timedelta
 
 
-def parser(username=ELJUR_USERNAME, password=ELJUR_PASSWORD, group=''):
+CACHE_DURATION = timedelta(minutes=10)
+_cached_days = None         # Здесь будем хранить парсинг
+_cache_timestamp = None     # Время последнего обновления кэша
+
+
+def schedule_cache(username: str, password: str, group: str = ''):
+    """
+    Возвращает кэш расписания.
+    Если кэш устарел, парсит сайт заново.
+    :param username: логин ЭлЖур
+    :param password: пароль ЭлЖур
+    :param group:    группа (если нужно конкретное расписание для группы)
+    :return:         словарь с расписанием
+    """
+    global _cached_days, _cache_timestamp
+    now = datetime.datetime.now()
+
+    if _cached_days is None or _cache_timestamp is None or (now - _cache_timestamp) > CACHE_DURATION:
+        _cached_days = parser(username, password, group)
+        _cache_timestamp = now
+
+    return _cached_days
+
+
+def parser(username: str, password: str, group: str = '') -> dict:
+    """
+    Авторизуется на сайте Eljur и парсит расписание.
+    """
+
     session = requests.session()
     link = 'https://mtkp.eljur.ru/ajaxauthorize'
 
-    user = fake_useragent.UserAgent().random
-    header = {
-        'user-agent': user
-    }
+    user_agent = fake_useragent.UserAgent().random
+    headers = {'user-agent': user_agent}
 
     data = {
         'username': username,
         'password': password,
         'return_uri': ''
     }
+
     # Авторизация
-    response = session.post(link, data=data, headers=header).text
-    if group != '':
+    response_auth = session.post(link, data=data, headers=headers)
+    if response_auth.status_code != 200:
+        return {}
+
+    if group:
         raspisanie_link = f'https://mtkp.eljur.ru/journal-schedule-action/class.{group}'
     else:
         raspisanie_link = 'https://mtkp.eljur.ru/journal-schedule-action/'
 
-    # Парсим расписание
+    # Получаем страницу с расписанием
+    response = session.get(raspisanie_link, headers=headers)
+    if response.status_code != 200:
+        return {}
 
-    response = session.get(raspisanie_link, headers=header)  # Получаем ответ
     page = BeautifulSoup(response.text, 'html.parser')
-
     all_days = page.findAll(class_='schedule__day__content')
 
-    days = dict()
+    days = {}
     for day in all_days:
         day_name = day.find(class_='schedule__day__content__header').text.strip()
         days[day_name] = []
         for para in day.findAll(class_='schedule__day__content__lesson--main'):
-            # Проверяем, что урок не является неактивным
             if "schedule__day__content__lesson--inactive" not in para.get('class', []):
-                lesson = dict()
+                lesson = {}
                 lesson['paraTime'] = para.findNext(class_='schedule__day__content__lesson__time').text.strip()
                 lesson['paraNum'] = para.findNext(class_='schedule__day__content__lesson__num').text.strip()
                 lesson['paraName'] = para.findNext(class_='schedule-lesson').text.strip()
                 lesson['paraTeacher'] = para.findNext(class_='schedule-teacher').text.strip()
                 lesson['paraRoom'] = para.findNext(class_='schedule__day__content__lesson__room').text.strip()
                 days[day_name].append(lesson)
+
     return days
 
 
-def get_schedule_for_day(days, day_input):
-    """Прнимает массив данных с парсера и день недели"""
+def get_schedule_for_day(days: dict, day_input: str) -> str:
+    """
+    Возвращает текст расписания на конкретный день недели.
+    :param days       словарь с расписанием (ключ — день недели, значение — список пар)
+    :param day_input  день недели, например 'Понедельник'
+    :return           текстовое представление расписания
+    """
+
     day_input = str(day_input).capitalize()
     day_schedule = days.get(day_input, [])
     if day_schedule:
@@ -68,7 +100,12 @@ def get_schedule_for_day(days, day_input):
             schedule_info = f"Расписание на {day_input.lower()}:\n"
 
         for para in day_schedule:
-            schedule_info += f"{para['paraNum']} пара: {para['paraName']}\nВремя: {para['paraTime']}\nПреподаватель: {para['paraTeacher']}\nКабинет: {para['paraRoom']}\n\n"
+            schedule_info += (
+                f"{para['paraNum']} пара: {para['paraName']}\n"
+                f"Время: {para['paraTime']}\n"
+                f"Преподаватель: {para['paraTeacher']}\n"
+                f"Кабинет: {para['paraRoom']}\n\n"
+            )
         return schedule_info
     else:
         if day_input in ('Суббота', 'Среда', 'Пятница'):
@@ -77,101 +114,107 @@ def get_schedule_for_day(days, day_input):
             return f"На {day_input} нет расписания."
 
 
-def get_info(day_input: str, para_num: str, days):
-    day_input = str(day_input)
-    para_num = str(para_num)
+def get_next_class_info(days: dict) -> str:
+    """
+    Возвращает информацию о ближайшей (следующей) паре на сегодня.
+    :param days: словарь с расписанием
+    :return:     текст с описанием следующей пары или 'Сегодня нет занятий' / 'На сегодня больше нет пар'
+    """
     try:
-        day_schedule = days.get(day_input, [])
+        locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+    except locale.Error:
+        pass
 
-        if day_schedule:
-            para_found = False
-            for para in day_schedule:
-                if para['paraNum'] == para_num:
-                    para_found = True
-                    info = f"Информация о {para['paraNum']}-ой паре в {day_input.lower()}:\n"
-                    info += f"Время: {para['paraTime']}\n"
-                    info += f"Название предмета: {para['paraName']}\n"
-                    info += f"Преподаватель: {para['paraTeacher']}\n"
-                    info += f"Аудитория: {para['paraRoom']}\n"
-                    return info
-            if not para_found:
-                if day_input == 'Вторник':
-                    return f"Во {day_input.lower()} нет пары с номером {para_num}."
-                elif day_input in ('Среда', 'Пятница', 'Суббота'):
-                    return f"В {day_input.lower()[0:-1]}у нет пары с номером {para_num}."
-                else:
-                    return f"В {day_input.lower()} нет пары с номером {para_num}."
-        else:
-            if day_input in ('Суббота', 'Среда', 'Пятница'):
-                return f"На {day_input.lower()[0:-1]}у нет расписания."
-    except Exception:
-        return 'Вы дурак, передайте день и номер пары через пробел'
-
-
-def get_next_class_info(days):
-    locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
-    # Получаем текущее время и день недели
     current_time = datetime.datetime.now()
     current_weekday = current_time.strftime("%A").capitalize()
     current_hour = current_time.hour
     current_minute = current_time.minute
 
-    # Определяем следующую пару
-    next_class_info = ""
     if current_weekday in days:
         day_schedule = days[current_weekday]
+
         for para in day_schedule:
-            para_num = int(para['paraNum'])
-            para_time_start = int(para['paraTime'].split(':')[0])
-            para_time_end = (para['paraTime'].split(':')[1].split('-')[0])
+            # Разбираем время пары вида "10:00-10:45"
+            time_range = para['paraTime']
+            time_range = time_range.replace("–", "-")
+            try:
+                start_str, end_str = time_range.split('-')
+                start_str = start_str.strip()
+                end_str = end_str.strip()
 
-            # Проверяем, прошла ли уже пара
-            if current_hour < para_time_start or (current_hour == para_time_start and current_minute < 30):
-                next_class_info += f"Следующая пара: {para['paraNum']}-я\nДисциплина :{para['paraName']}\nНачало в {para['paraTime']}\nАудитория: {para['paraRoom']}\n"
-                break
-        if not next_class_info:
-            next_class_info = "На сегодня больше нет пар."
+                start_hour, start_minute = map(int, start_str.split(':'))
+
+
+                if (current_hour < start_hour) or (current_hour == start_hour and current_minute < start_minute):
+                    return (
+                        f"Следующая пара: {para['paraNum']} \n"
+                        f"Дисциплина: {para['paraName']}\n"
+                        f"Начало в {para['paraTime']}\n"
+                        f"Аудитория: {para['paraRoom']}\n"
+                    )
+            except ValueError:
+                return "Ошибка в формате времени пары."
+
+        return "На сегодня больше нет пар."
     else:
-        next_class_info = "Сегодня нет занятий."
-
-    return next_class_info
+        return "Сегодня нет занятий."
 
 
-def get_schedule_for_tomorrow(days):
-    locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+def get_schedule_for_tomorrow(days: dict) -> str:
+    """
+    Возвращает расписание на завтрашний день.
+    :param days: словарь с расписанием
+    :return:     текстовое представление расписания
+    """
+    try:
+        locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+    except locale.Error:
+        pass
 
     current_date = datetime.datetime.now()
     tomorrow_date = current_date + datetime.timedelta(days=1)
     tomorrow_weekday = tomorrow_date.strftime("%A").capitalize()
 
-    # Получаем расписание на завтра
-    schedule_info = ""
     if tomorrow_weekday in days:
-        schedule_info += f"Расписание на завтра ({tomorrow_date.strftime('%A').capitalize()}):\n"
+        schedule_info = f"Расписание на завтра ({tomorrow_weekday}):\n"
         day_schedule = days[tomorrow_weekday]
         for para in day_schedule:
-            schedule_info += f"{para['paraNum']} пара: {para['paraName']}\nВремя: {para['paraTime']}\nПреподаватель: {para['paraTeacher']}\nКабинет: {para['paraRoom']}\n\n"
+            schedule_info += (
+                f"{para['paraNum']} пара: {para['paraName']}\n"
+                f"Время: {para['paraTime']}\n"
+                f"Преподаватель: {para['paraTeacher']}\n"
+                f"Кабинет: {para['paraRoom']}\n\n"
+            )
     else:
-        schedule_info = f"На завтра ({tomorrow_date.strftime('%A').capitalize()}) нет расписания."
+        schedule_info = f"На завтра ({tomorrow_weekday}) нет расписания."
 
     return schedule_info
 
 
-def get_schedule_for_today(days):
-    # Устанавливаем русскую локаль
-    locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+def get_schedule_for_today(days: dict) -> str:
+    """
+    Возвращает расписание на сегодня.
+    :param days: словарь с расписанием
+    :return:     текстовое представление расписания
+    """
+    try:
+        locale.setlocale(locale.LC_ALL, 'ru_RU.UTF-8')
+    except locale.Error:
+        pass
 
-    # Получаем текущую дату
-    current_date = datetime.datetime.now().strftime("%A").capitalize()
+    current_weekday = datetime.datetime.now().strftime("%A").capitalize()
 
-    # Получаем расписание на завтра
-    schedule_info = ""
-    if current_date in days:
-        schedule_info += f"Расписание на сегодня ({current_date}):\n"
-        day_schedule = days[current_date]
+    if current_weekday in days:
+        schedule_info = f"Расписание на сегодня ({current_weekday}):\n"
+        day_schedule = days[current_weekday]
         for para in day_schedule:
-            schedule_info += f"{para['paraNum']} пара: {para['paraName']}\nВремя: {para['paraTime']}\nПреподаватель: {para['paraTeacher']}\nКабинет: {para['paraRoom']}\n\n"
+            schedule_info += (
+                f"{para['paraNum']} пара: {para['paraName']}\n"
+                f"Время: {para['paraTime']}\n"
+                f"Преподаватель: {para['paraTeacher']}\n"
+                f"Кабинет: {para['paraRoom']}\n\n"
+            )
     else:
-        schedule_info = f"На сегодня ({current_date.capitalize()}) нет расписания."
+        schedule_info = f"На сегодня ({current_weekday}) нет расписания."
 
     return schedule_info
